@@ -1,4 +1,6 @@
 from __future__ import annotations
+import os
+from groq import Groq
 
 import io
 import warnings
@@ -337,10 +339,14 @@ def main():
         show["Predicted_Default_Risk"] = (show["Predicted_Default_Risk"] * 100).round(1).astype(str) + "%"
         st.dataframe(show, use_container_width=True, hide_index=True)
         top20 = ranked.head(min(20, len(ranked)))
+        st.markdown("**Top-20 action plan** — click 🤖 Ask AI on any row")
+        ai_top20_table(top20, X.columns, display_id)
         st.markdown("**Top-20 action plan**")
         st.dataframe(top20[columns_to_show].assign(
             Predicted_Default_Risk=(top20["Predicted_Default_Risk"] * 100).round(1).astype(str) + "%"
         ), use_container_width=True, hide_index=True)
+
+        
         st.download_button("⬇️ Download full ranked queue (CSV)", ranked.to_csv(index=False).encode("utf-8"), "creditwise_ranked_queue.csv", "text/csv")
         st.download_button("⬇️ Download Top-20 action plan (CSV)", top20.to_csv(index=False).encode("utf-8"), "creditwise_top20_actions.csv", "text/csv")
 
@@ -375,6 +381,82 @@ def main():
         st.write("Columns in source dataset:", list(raw.columns))
         st.write("Model features used:", list(X.columns))
         st.write("Identifier columns excluded from training when detected:", [c for c in raw.columns if norm_name(c) in ID_CANDIDATES or norm_name(c).startswith("unnamed")])
+SENSITIVE = {"sex", "marriage", "education", "age"}
 
+SYSTEM_PROMPT = (
+    "You are a credit-risk analyst assistant. Explain in 3-4 plain sentences why a customer "
+    "was ranked high in a default-risk review queue. Use ONLY the facts provided. "
+    "Do not invent numbers. Describe model signals, not proof of future default. "
+    "End with one suggested follow-up action."
+)
+
+def get_api_key():
+    try:
+        return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        return os.getenv("GROQ_API_KEY")
+
+def build_facts(row, columns):
+    facts = {}
+    for c in columns:
+        if norm_name(c) in SENSITIVE:
+            continue
+        try:
+            facts[c] = round(float(row[c]), 2)
+        except Exception:
+            pass
+    return facts
+
+@st.fragment
+def ai_top20_table(top20, feature_cols, display_id):
+    if not get_api_key():
+        st.caption("Add GROQ_API_KEY to .streamlit/secrets.toml to enable AI explanations.")
+        return
+    widths = [0.7, 1, 1, 1.2, 4, 1.5]
+    for col, h in zip(st.columns(widths), ["Rank", "ID", "Risk", "Band", "Top risk reasons", "AI"]):
+        col.markdown(f"**{h}**")
+    for _, row in top20.iterrows():
+        rank = int(row["Review_Rank"])
+        key = f"ai_{rank}_{row['Predicted_Default_Risk']:.4f}"
+        c = st.columns(widths)
+        c[0].write(rank)
+        c[1].write(row[display_id] if display_id else "-")
+        c[2].write(f"{row['Predicted_Default_Risk']:.1%}")
+        c[3].write(str(row["Risk_Band"]))
+        c[4].write(row["Top_Risk_Reasons"])
+        if c[5].button("🤖 Ask AI", key="btn_" + key):
+            with st.spinner("Asking Groq..."):
+                try:
+                    st.session_state[key] = ai_reason(
+                        f"{row['Predicted_Default_Risk']:.1%}",
+                        row["Top_Risk_Reasons"],
+                        build_facts(row, feature_cols),
+                    )
+                except Exception as e:
+                    st.session_state[key] = f"⚠️ Groq request failed: {e}"
+        if key in st.session_state:
+            st.info(st.session_state[key])
+@st.cache_data(show_spinner=False, ttl=3600)
+def ai_reason(risk_pct, rule_reasons, facts):
+    client = Groq(api_key=get_api_key())
+    user_msg = (
+        f"Predicted default risk: {risk_pct}\n"
+        f"Rule-based reasons: {rule_reasons}\n"
+        f"Customer data: {facts}\n"
+        "Pay_0/Pay_2.. values: -1 = paid on time, 1+ = months of delay."
+    )
+    resp = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        temperature=0.2,
+        max_tokens=1500,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise ValueError("Model returned empty text; increase max_tokens")
+    return text
 if __name__ == "__main__":
     main()
